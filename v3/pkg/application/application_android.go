@@ -14,6 +14,46 @@ static JavaVM* g_jvm = NULL;
 // Global reference to the WailsBridge object (must be a global ref, not local)
 static jobject g_bridge = NULL;
 
+// Returns global ref on WailsBridge
+// Caller should control ref by self
+static jobject getBridgeRef(void) {
+    return g_bridge;
+}
+
+static JavaVM* getBridgeJVM(void) {
+    return g_jvm;
+}
+
+static void jniDetachCurrentThread(JavaVM* vm) {
+    if (vm != NULL) (*vm)->DetachCurrentThread(vm);
+}
+
+static jclass jniGetObjectClass(JNIEnv* env, jobject obj) {
+    return (*env)->GetObjectClass(env, obj);
+}
+
+static jmethodID jniGetMethodId(JNIEnv* env, jclass cls,
+                                   const char* name, const char* sig) {
+    return (*env)->GetMethodID(env, cls, name, sig);
+}
+
+static jobject jniCallObjectMethodNoArgs(JNIEnv* env, jobject obj,
+                                             jmethodID mid) {
+    return (*env)->CallObjectMethod(env, obj, mid);
+}
+
+static jobject jniNewGlobalRef(JNIEnv* env, jobject obj) {
+    return (*env)->NewGlobalRef(env, obj);
+}
+
+static void jniDeleteGlobalRef(JNIEnv* env, jobject obj) {
+    if (obj != NULL) (*env)->DeleteGlobalRef(env, obj);
+}
+
+static void jniDeleteLocalRef(JNIEnv* env, jobject obj) {
+    if (obj != NULL) (*env)->DeleteLocalRef(env, obj);
+}
+
 // Cached method ID for the hot executeJavaScript path
 static jmethodID g_executeJsMethod = NULL;
 
@@ -23,6 +63,27 @@ static void wails_set_verbose(int v) { g_verbose = v; }
 
 #define WLOGD(...) do { if (g_verbose) __android_log_print(ANDROID_LOG_DEBUG, "Wails", __VA_ARGS__); } while (0)
 #define WLOGE(...) __android_log_print(ANDROID_LOG_ERROR, "Wails", __VA_ARGS__)
+
+// jniGetEnvForVM returns the JNIEnv for the current thread using the given
+// JavaVM, attaching the thread if necessary. Sets *needsDetach to 1 when the
+// caller must call jni_detach_current_thread afterwards.
+static JNIEnv* jniGetEnvForVM(JavaVM* vm, int* needsDetach) {
+    *needsDetach = 0;
+    if (vm == NULL) return NULL;
+    JNIEnv* env = NULL;
+    jint r = (*vm)->GetEnv(vm, (void**)&env, JNI_VERSION_1_6);
+    if (r == JNI_EDETACHED) {
+        if ((*vm)->AttachCurrentThread(vm, &env, NULL) != 0) {
+            WLOGE("jniGetEnvForVM: AttachCurrentThread failed");
+            return NULL;
+        }
+        *needsDetach = 1;
+    } else if (r != JNI_OK) {
+        WLOGE("jniGetEnvForVM: GetEnv failed: %d", (int)r);
+        return NULL;
+    }
+    return env;
+}
 
 static void wails_log(int prio, const char* msg) {
     __android_log_write(prio, "Wails", msg);
@@ -300,6 +361,7 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -327,6 +389,175 @@ var (
 	appReady     = make(chan struct{})
 	appReadyOnce sync.Once
 )
+
+// JavaVMHandle is an opaque handle to the process-wide JavaVM captured during
+// Java_com_wails_app_WailsBridge_nativeInit. It is safe to copy and to use
+// from any goroutine; it must not be released.
+type JavaVMHandle uintptr
+
+// GetJavaVM returns a handle to the JavaVM captured during nativeInit.
+// Returns 0 if the JVM has not been initialised yet (nativeInit not called).
+// The handle remains valid for the entire process lifetime.
+func GetJavaVM() JavaVMHandle {
+	return JavaVMHandle(uintptr(unsafe.Pointer(C.getBridgeJVM())))
+}
+
+// Valid reports whether the handle refers to an initialised JavaVM.
+func (vm JavaVMHandle) Valid() bool {
+	return vm != 0
+}
+
+// raw returns the underlying C pointer. Callers must check Valid first.
+func (vm JavaVMHandle) raw() *C.JavaVM {
+	return (*C.JavaVM)(unsafe.Pointer(uintptr(vm)))
+}
+
+// JNIEnvHandle wraps a JNIEnv for a specific thread. The caller must call
+// Release when done. Not safe for concurrent use.
+type JNIEnvHandle struct {
+	vm          JavaVMHandle
+	env         *C.JNIEnv
+	needsDetach bool
+}
+
+// Attach returns a JNIEnv for the calling OS thread, attaching the thread to
+// the JVM if required. The returned handle must be released with Release.
+func (vm JavaVMHandle) Attach() (*JNIEnvHandle, error) {
+	if !vm.Valid() {
+		return nil, errors.New("[application_android.go]: JavaVM not initialised")
+	}
+	var needsDetach C.int
+	env := C.jniGetEnvForVM(vm.raw(), &needsDetach)
+	if env == nil {
+		return nil, errors.New("[application_android.go]: failed to obtain JNIEnv")
+	}
+	return &JNIEnvHandle{
+		vm:          vm,
+		env:         env,
+		needsDetach: needsDetach != 0,
+	}, nil
+}
+
+// Env returns the raw JNIEnv pointer. Valid until Release is called.
+func (h *JNIEnvHandle) Env() *C.JNIEnv {
+	if h == nil {
+		return nil
+	}
+	return h.env
+}
+
+// Release detaches the thread from the JVM if Attach attached it, and
+// invalidates the handle. Safe to call multiple times.
+func (h *JNIEnvHandle) Release() {
+	if h == nil || h.env == nil {
+		return
+	}
+	if h.needsDetach {
+		C.jniDetachCurrentThread(h.vm.raw())
+	}
+	h.env = nil
+}
+
+// clearJNIException is a Go-friendly wrapper around C.clearException that
+// accepts a Go string for the "where" argument.
+func clearJNIException(env *C.JNIEnv, where string) {
+	cwhere := C.CString(where)
+	defer C.free(unsafe.Pointer(cwhere))
+	C.clearException(env, cwhere)
+}
+
+func GetAndroidBridgeRef() (C.jobject, error) {
+	var needsDetach C.int
+	env := C.wailsGetEnv(&needsDetach)
+	if env == nil {
+		return 0, errors.New("[application_android.go]: cannot obtain JNIEnv")
+	}
+	defer C.wailsReleaseEnv(needsDetach)
+
+	bridge := C.getBridgeRef()
+	if bridge == 0 {
+		return 0, errors.New("[application_android.go]: WailsBridge not initialised")
+	}
+
+	ref := C.jniNewGlobalRef(env, bridge)
+	if ref == 0 {
+		clearJNIException(env, "NewGlobalRef(WailsBridge)")
+		return 0, errors.New("[application_android.go]: failed to create global ref for WailsBridge")
+	}
+	return ref, nil
+}
+
+func ReleaseAndroidBridge(ref C.jobject) {
+	if ref == 0 {
+		return
+	}
+	var needsDetach C.int
+	env := C.wailsGetEnv(&needsDetach)
+	if env == nil {
+		return
+	}
+	C.jniDeleteGlobalRef(env, ref)
+	C.wailsReleaseEnv(needsDetach)
+}
+
+func GetAndroidActivity() (C.jobject, error) {
+	var needsDetach C.int
+	env := C.wailsGetEnv(&needsDetach)
+	if env == nil {
+		return 0, errors.New("[application_android.go]: cannot obtain JNIEnv")
+	}
+	defer C.wailsReleaseEnv(needsDetach)
+
+	bridge := C.getBridgeRef()
+	if bridge == 0 {
+		return 0, errors.New("[application_android.go]: WailsBridge not initialised")
+	}
+
+	bridgeClass := C.jniGetObjectClass(env, bridge)
+	if bridgeClass == 0 {
+		clearJNIException(env, "GetObjectClass(WailsBridge)")
+		return 0, errors.New("[application_android.go]: cannot resolve WailsBridge class")
+	}
+	defer C.jniDeleteLocalRef(env, C.jobject(bridgeClass))
+
+	cName := C.CString("getActivity")
+	defer C.free(unsafe.Pointer(cName))
+	cSig := C.CString("()Landroid/app/Activity;")
+	defer C.free(unsafe.Pointer(cSig))
+
+	mid := C.jniGetMethodId(env, bridgeClass, cName, cSig)
+	if mid == nil {
+		clearJNIException(env, "GetMethodID(WailsBridge.getActivity)")
+		return 0, errors.New("[application_android.go]: WailsBridge.getActivity() not found")
+	}
+
+	localCtx := C.jniCallObjectMethodNoArgs(env, bridge, mid)
+	if localCtx == 0 {
+		clearJNIException(env, "CallObjectMethod(WailsBridge.getActivity)")
+		return 0, errors.New("[application_android.go]: WailsBridge.getActivity() returned null")
+	}
+	defer C.jniDeleteLocalRef(env, localCtx)
+
+	globalCtx := C.jniNewGlobalRef(env, localCtx)
+	if globalCtx == 0 {
+		clearJNIException(env, "NewGlobalRef(Activity)")
+		return 0, errors.New("[application_android.go]: failed to create global ref for Activity")
+	}
+	return globalCtx, nil
+}
+
+func ReleaseAndroidActivity(ref C.jobject) {
+	if ref == 0 {
+		return
+	}
+	var needsDetach C.int
+	env := C.wailsGetEnv(&needsDetach)
+	if env == nil {
+		return
+	}
+	C.jniDeleteGlobalRef(env, ref)
+	C.wailsReleaseEnv(needsDetach)
+}
 
 // androidLogf logs through logcat (tag "Wails") so messages are visible in
 // `adb logcat`. Go's stdout/stderr are not routed anywhere on Android.

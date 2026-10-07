@@ -126,6 +126,10 @@ public class WailsBridge {
         this.activity = activity;
     }
 
+    public Activity getActivity() {
+        return this.activity;
+    }
+
     /**
      * Initialize the native Go library
      */
